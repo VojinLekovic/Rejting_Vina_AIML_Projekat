@@ -2,6 +2,7 @@ import argparse
 import inspect
 import logging
 import os
+import time
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -34,6 +35,8 @@ from sklearn.metrics import (
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
 
 DATA_PATH = 'winemag-data-130k-v2.csv'
+DEFAULT_SVM_TRAIN_SAMPLE = 5000
+DEFAULT_LEARNING_CURVE_SAMPLE = 3000
 
 
 def load_data(path=DATA_PATH, sample_size=0):
@@ -122,7 +125,7 @@ def get_regression_models():
         'SVR_poly': SVR(kernel='poly', degree=2, C=1.0, gamma='scale'),
         'SVR_rbf': SVR(kernel='rbf', C=1.0, gamma='scale'),
         'DecisionTree': DecisionTreeRegressor(random_state=42),
-        'RandomForest': RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1),
+        'RandomForest': RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=1),
         'BaggingTree': BaggingRegressor(estimator=DecisionTreeRegressor(random_state=42), n_estimators=10, bootstrap=False, random_state=42),
     }
 
@@ -135,59 +138,123 @@ def get_classification_models():
         'SVC_poly': SVC(kernel='poly', degree=2, probability=True, random_state=42),
         'SVC_rbf': SVC(kernel='rbf', probability=True, random_state=42),
         'DecisionTree': DecisionTreeClassifier(random_state=42),
-        'RandomForest': RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1),
+        'RandomForest': RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=1),
         'BaggingTree': BaggingClassifier(estimator=DecisionTreeClassifier(random_state=42), n_estimators=10, bootstrap=False, random_state=42),
     }
 
 
-def evaluate_regression(models, X_train, X_test, y_train, y_test, output_dir):
+def _sample_training_data(X_train, y_train, max_rows, stratify=False):
+    if not max_rows or max_rows <= 0 or len(X_train) <= max_rows:
+        return X_train, y_train
+
+    if stratify:
+        _, X_sample, _, y_sample = train_test_split(
+            X_train,
+            y_train,
+            test_size=max_rows,
+            random_state=42,
+            stratify=y_train,
+        )
+    else:
+        X_sample = X_train.sample(n=max_rows, random_state=42)
+        y_sample = y_train.loc[X_sample.index]
+
+    return X_sample, y_sample
+
+
+def _save_metrics_so_far(results, output_path, sort_by, ascending=True):
+    if not results:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(results).sort_values(sort_by, ascending=ascending)
+    df.to_csv(output_path, index=False)
+    return df
+
+
+def evaluate_regression(models, X_train, X_test, y_train, y_test, output_dir, svm_train_sample=DEFAULT_SVM_TRAIN_SAMPLE):
     results = []
+    output_path = os.path.join(output_dir, 'regression_metrics.csv')
     for name, estimator in models.items():
         logging.info('Training regression model: %s', name)
         poly = name == 'PolynomialRegression'
         preprocessor = build_preprocessor(['price', 'desc_len'], ['country', 'province', 'variety', 'winery'], polynomial=poly)
         pipeline = Pipeline(steps=[('preprocessor', preprocessor), ('model', estimator)])
-        pipeline.fit(X_train, y_train)
-        preds = pipeline.predict(X_test)
-        mae = mean_absolute_error(y_test, preds)
-        rmse = np.sqrt(mean_squared_error(y_test, preds))
-        r2 = r2_score(y_test, preds)
-        results.append({'model': name, 'MAE': mae, 'RMSE': rmse, 'R2': r2})
-    df = pd.DataFrame(results).sort_values('RMSE')
-    df.to_csv(os.path.join(output_dir, 'regression_metrics.csv'), index=False)
-    logging.info('Saved regression metrics to %s', os.path.join(output_dir, 'regression_metrics.csv'))
+
+        fit_X, fit_y = X_train, y_train
+        if name.startswith('SVR_'):
+            fit_X, fit_y = _sample_training_data(X_train, y_train, svm_train_sample)
+            logging.info('Using %d train rows for %s because SVR does not scale well to the full dataset', len(fit_X), name)
+
+        started = time.perf_counter()
+        try:
+            pipeline.fit(fit_X, fit_y)
+            preds = pipeline.predict(X_test)
+            mae = mean_absolute_error(y_test, preds)
+            rmse = np.sqrt(mean_squared_error(y_test, preds))
+            r2 = r2_score(y_test, preds)
+            elapsed = time.perf_counter() - started
+            results.append({'model': name, 'MAE': mae, 'RMSE': rmse, 'R2': r2, 'train_rows': len(fit_X), 'seconds': elapsed})
+            _save_metrics_so_far(results, output_path, sort_by='RMSE')
+            logging.info('Finished %s in %.1f seconds', name, elapsed)
+        except Exception as exc:
+            logging.exception('Regression model failed: %s', name)
+            results.append({'model': name, 'MAE': np.nan, 'RMSE': np.nan, 'R2': np.nan, 'train_rows': len(fit_X), 'seconds': time.perf_counter() - started, 'error': str(exc)})
+            _save_metrics_so_far(results, output_path, sort_by='RMSE')
+
+    df = _save_metrics_so_far(results, output_path, sort_by='RMSE')
+    logging.info('Saved regression metrics to %s', output_path)
     return df
 
 
-def evaluate_classification(models, X_train, X_test, y_train, y_test, output_dir):
+def evaluate_classification(models, X_train, X_test, y_train, y_test, output_dir, svm_train_sample=DEFAULT_SVM_TRAIN_SAMPLE):
     results = []
+    output_path = os.path.join(output_dir, 'classification_metrics.csv')
     for name, estimator in models.items():
         logging.info('Training classification model: %s', name)
         preprocessor = build_preprocessor(['price', 'desc_len'], ['country', 'province', 'variety', 'winery'])
         pipeline = Pipeline(steps=[('preprocessor', preprocessor), ('model', estimator)])
-        pipeline.fit(X_train, y_train)
-        preds = pipeline.predict(X_test)
-        accuracy = accuracy_score(y_test, preds)
-        precision = precision_score(y_test, preds, average='macro', zero_division=0)
-        recall = recall_score(y_test, preds, average='macro', zero_division=0)
-        f1 = f1_score(y_test, preds, average='macro', zero_division=0)
-        results.append({'model': name, 'accuracy': accuracy, 'precision': precision, 'recall': recall, 'f1': f1})
-    df = pd.DataFrame(results).sort_values('f1', ascending=False)
-    df.to_csv(os.path.join(output_dir, 'classification_metrics.csv'), index=False)
-    logging.info('Saved classification metrics to %s', os.path.join(output_dir, 'classification_metrics.csv'))
+
+        fit_X, fit_y = X_train, y_train
+        if name.startswith('SVC_'):
+            fit_X, fit_y = _sample_training_data(X_train, y_train, svm_train_sample, stratify=True)
+            logging.info('Using %d train rows for %s because SVC does not scale well to the full dataset', len(fit_X), name)
+
+        started = time.perf_counter()
+        try:
+            pipeline.fit(fit_X, fit_y)
+            preds = pipeline.predict(X_test)
+            accuracy = accuracy_score(y_test, preds)
+            precision = precision_score(y_test, preds, average='macro', zero_division=0)
+            recall = recall_score(y_test, preds, average='macro', zero_division=0)
+            f1 = f1_score(y_test, preds, average='macro', zero_division=0)
+            elapsed = time.perf_counter() - started
+            results.append({'model': name, 'accuracy': accuracy, 'precision': precision, 'recall': recall, 'f1': f1, 'train_rows': len(fit_X), 'seconds': elapsed})
+            _save_metrics_so_far(results, output_path, sort_by='f1', ascending=False)
+            logging.info('Finished %s in %.1f seconds', name, elapsed)
+        except Exception as exc:
+            logging.exception('Classification model failed: %s', name)
+            results.append({'model': name, 'accuracy': np.nan, 'precision': np.nan, 'recall': np.nan, 'f1': np.nan, 'train_rows': len(fit_X), 'seconds': time.perf_counter() - started, 'error': str(exc)})
+            _save_metrics_so_far(results, output_path, sort_by='f1', ascending=False)
+
+    df = _save_metrics_so_far(results, output_path, sort_by='f1', ascending=False)
+    logging.info('Saved classification metrics to %s', output_path)
     return df
 
 
-def plot_learning_curve_for_model(name, estimator, X, y, output_dir, scoring='neg_mean_squared_error'):
+def plot_learning_curve_for_model(name, estimator, X, y, output_dir, scoring='neg_mean_squared_error', max_rows=DEFAULT_LEARNING_CURVE_SAMPLE):
     logging.info('Plotting learning curve for model: %s', name)
+    X_curve, y_curve = _sample_training_data(X, y, max_rows)
+    if len(X_curve) < len(X):
+        logging.info('Using %d rows for %s learning curve', len(X_curve), name)
+
     train_sizes, train_scores, test_scores = learning_curve(
         estimator,
-        X,
-        y,
+        X_curve,
+        y_curve,
         cv=5,
         scoring=scoring,
         train_sizes=np.linspace(0.1, 1.0, 5),
-        n_jobs=-1,
+        n_jobs=1,
         random_state=42,
     )
     train_scores_mean = -np.mean(train_scores, axis=1)
@@ -266,6 +333,8 @@ def main():
     parser.add_argument('--data', '-d', default=DATA_PATH, help='Path to dataset CSV')
     parser.add_argument('--sample', '-s', type=int, default=0, help='Use a random subset of this many rows')
     parser.add_argument('--output', '-o', default='ml_experiments_output', help='Directory to save results and plots')
+    parser.add_argument('--svm-train-sample', type=int, default=DEFAULT_SVM_TRAIN_SAMPLE, help='Maximum train rows for SVR/SVC models. Use 0 for full data.')
+    parser.add_argument('--learning-curve-sample', type=int, default=DEFAULT_LEARNING_CURVE_SAMPLE, help='Maximum rows for learning-curve plots. Use 0 for full data.')
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -284,8 +353,8 @@ def main():
     reg_models = get_regression_models()
     clf_models = get_classification_models()
 
-    regression_metrics = evaluate_regression(reg_models, X_reg_train, X_reg_test, y_reg_train, y_reg_test, args.output)
-    classification_metrics = evaluate_classification(clf_models, X_clf_train, X_clf_test, y_clf_train, y_clf_test, args.output)
+    regression_metrics = evaluate_regression(reg_models, X_reg_train, X_reg_test, y_reg_train, y_reg_test, args.output, svm_train_sample=args.svm_train_sample)
+    classification_metrics = evaluate_classification(clf_models, X_clf_train, X_clf_test, y_clf_train, y_clf_test, args.output, svm_train_sample=args.svm_train_sample)
 
     regression_metrics.to_csv(os.path.join(args.output, 'regression_metrics.csv'), index=False)
     classification_metrics.to_csv(os.path.join(args.output, 'classification_metrics.csv'), index=False)
@@ -299,13 +368,16 @@ def main():
     for model_name in ['LinearRegression', 'RandomForest', 'SVR_rbf']:
         estimator = reg_models[model_name]
         pipeline = Pipeline(steps=[('preprocessor', build_preprocessor(['price', 'desc_len'], ['country', 'province', 'variety', 'winery'])), ('model', estimator)])
-        plot_learning_curve_for_model(model_name, pipeline, X_reg_train, y_reg_train, args.output)
+        plot_learning_curve_for_model(model_name, pipeline, X_reg_train, y_reg_train, args.output, max_rows=args.learning_curve_sample)
 
     # Use the best classifier for curves and confusion matrix
     best_clf_name = classification_metrics.iloc[0]['model']
     best_clf = clf_models[best_clf_name]
+    best_fit_X, best_fit_y = X_clf_train, y_clf_train
+    if best_clf_name.startswith('SVC_'):
+        best_fit_X, best_fit_y = _sample_training_data(X_clf_train, y_clf_train, args.svm_train_sample, stratify=True)
     best_pipeline = Pipeline(steps=[('preprocessor', build_preprocessor(['price', 'desc_len'], ['country', 'province', 'variety', 'winery'])), ('model', best_clf)])
-    best_pipeline.fit(X_clf_train, y_clf_train)
+    best_pipeline.fit(best_fit_X, best_fit_y)
     plot_confusion_matrix_and_curves(best_clf_name, best_pipeline, X_clf_test, y_clf_test, args.output)
 
     logging.info('ML experiments complete. Results saved to %s', args.output)
